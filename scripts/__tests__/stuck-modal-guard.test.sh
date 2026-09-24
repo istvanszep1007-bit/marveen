@@ -120,8 +120,25 @@ echo "(f) State-dir auto-create"
 # CHANNELS_SESSION points at a non-existent session so the guard no-ops at the
 # has-session check WITHOUT touching any real pane; the mkdir runs before that.
 TMP_F1="$(mktemp -d)"; NOSTORE="$TMP_F1/sub"   # NOSTORE does not exist yet
-CHANNELS_SESSION="nonexistent-modal-guard-test-channels" STUCK_MODAL_STATE_DIR="$NOSTORE" \
-  bash "$GUARD" >/dev/null 2>&1
+# TMUXISOLTMUXVAR921: and do not rely on the NAME alone for that guarantee. The
+# guard runs `tmux has-session` -- measured 2026-09-24 with a logging PATH shim:
+# `has-session -t nonexistent-modal-guard-test-channels` went to the INHERITED
+# server, i.e. the live fleet's. Today it answers "no" because no session bears
+# that name, so the case is safe by coincidence of naming, not by construction;
+# a hit would put the guard on a real pane, and this guard kills modals.
+# TMUX_TMPDIR alone does not isolate while $TMUX is set (the suite always runs
+# inside an agent pane), hence `env -u TMUX -u TMUX_PANE`.
+TMUX_ISO="$TMP_F1/tmux"; mkdir -p "$TMUX_ISO"
+# Prove it rather than trust it: an error is fine (no server = no sessions);
+# tmux answering with a session name is not.
+if env -u TMUX -u TMUX_PANE TMUX_TMPDIR="$TMUX_ISO" \
+     tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -q .; then
+  fail "F1: tmux isolation BROKEN -- the guard would query the live fleet server"
+else
+  env -u TMUX -u TMUX_PANE TMUX_TMPDIR="$TMUX_ISO" \
+    CHANNELS_SESSION="nonexistent-modal-guard-test-channels" STUCK_MODAL_STATE_DIR="$NOSTORE" \
+    bash "$GUARD" >/dev/null 2>&1
+fi
 [ -d "$NOSTORE" ] && pass "F1: run_guard creates a missing state dir (lock can't defer forever)" \
   || fail "F1: missing state dir not created — exec 9> on the lock would fail and defer recovery"
 rm -rf "$TMP_F1"

@@ -25,6 +25,38 @@ scripts/github-pr-monitor.sh
 scripts/hooks/telegram-ack.py
 "
 
+# ---------------------------------------------------------------------------
+# tmux isolation -- cases (b) and (c) run the REAL limit-monitor.sh
+# ---------------------------------------------------------------------------
+# TMUXISOLTMUXVAR921 (same class as in limit-monitor-signals.test.sh, measured
+# again here 2026-09-24): limit-monitor.sh does `tmux list-sessions` and then
+# `tmux capture-pane` on EVERY session it finds. Without this block the trace of
+# case (b) reads:
+#     ++ tmux capture-pane -t agent-leanarchivist -p
+#     ++ tmux capture-pane -t agent-leandev -p
+#     ++ tmux capture-pane -t agent-leanlibrarian -p
+#     ++ tmux capture-pane -t lean-chief-channels -p
+#     ++ tmux capture-pane -t lean-chief-worker -p
+#     ++ tmux capture-pane -t lean-chief-worker-fast -p
+# -- all six LIVE fleet panes, this suite's own pane among them. So the verdict
+# depended on what happened to be printed on the fleet's screens at that second:
+# a pane showing "Claude usage limit reached" turns a quiet case into an alarm,
+# and capturing our own pane feeds the suite's output back into its input.
+#
+# TMUX_TMPDIR ALONE DOES NOT ISOLATE: while $TMUX is set -- and it always is,
+# because the suite runs inside an agent's pane -- tmux takes the socket from
+# $TMUX and ignores TMUX_TMPDIR entirely.
+unset TMUX TMUX_PANE
+export TMUX_TMPDIR="$TMPDIR_BASE/tmux"; mkdir -p "$TMUX_TMPDIR"
+# Prove it instead of trusting it. An error here is FINE (no server = no panes);
+# what must never happen is tmux answering with a session name.
+if tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -q .; then
+  echo "  FAIL: tmux isolation BROKEN: the cases can see live sessions:"
+  tmux list-sessions -F '#{session_name}' 2>/dev/null | sed 's/^/          /'
+  echo "        Cases (b) and (c) would read those screens instead of a clean server."
+  exit 1
+fi
+
 echo "ops-scripts portability tests"
 echo "============================="
 
