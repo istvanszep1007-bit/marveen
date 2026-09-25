@@ -46,6 +46,56 @@ const lastRestart = new Map<string, number>()
 // extra window -- never overriding early.
 const openQuestionDeferrals = new Map<string, { sinceMs: number; count: number }>()
 
+// FAILED-RESTART BACKOFF (2026-09-21, card ee485f5e).
+//
+// The header comment above already names this failure once: "performRestart's
+// throw left lastRestart unset, so the runner retried ~every tick, forever".
+// That was fixed at the SOURCE of one exception (launchctl ENOENT), not at the
+// retry behaviour -- so the next exception brought it straight back. On
+// 2026-09-21 the Linux leg threw "can't find pane" on every tick from 03:00 to
+// 06:31, and because each attempt runs a DESTRUCTIVE pre-respawn reap first,
+// the retry loop was not merely noisy: it took the Telegram bridge down roughly
+// every six minutes all night, and Istvan's 04:01 and 04:16 messages went
+// unanswered.
+//
+// Neither extreme is right. Setting lastRestart on failure would mark the slot
+// done and silently skip the nightly restart (the ORIGINAL complaint). Leaving
+// it unset retries forever (today's). So: bounded retries with growing spacing,
+// then give up on THIS slot, loudly. The signal survives, the churn does not.
+const MAX_RESTART_ATTEMPTS = 5
+const FAILURE_BACKOFF_BASE_MS = 60_000
+const FAILURE_BACKOFF_CAP_MS = 15 * 60 * 1000
+
+/** Pure: how long to wait before attempt N+1 (N = failures so far, >= 1). */
+export function failureBackoffMs(failures: number): number {
+  const n = Math.max(1, Math.floor(failures))
+  const grown = FAILURE_BACKOFF_BASE_MS * Math.pow(2, n - 1)
+  return Math.min(grown, FAILURE_BACKOFF_CAP_MS)
+}
+
+export interface RestartFailureState { count: number; firstMs: number; nextAttemptMs: number }
+
+/**
+ * Pure: fold one more failure into the per-slot failure state. Returns either
+ * the next state (keep retrying, after nextAttemptMs) or a give-up verdict.
+ * Exported so the "cannot retry every tick" property is TESTED, not asserted by
+ * reading the code -- the 2026-09-21 outage was exactly this property failing.
+ */
+export function advanceFailureState(
+  prev: RestartFailureState | null,
+  nowMs: number,
+  maxAttempts: number = MAX_RESTART_ATTEMPTS,
+): { giveUp: true; attempts: number; firstMs: number } | { giveUp: false; next: RestartFailureState } {
+  const count = (prev?.count ?? 0) + 1
+  const firstMs = prev?.firstMs ?? nowMs
+  if (count >= maxAttempts) return { giveUp: true, attempts: count, firstMs }
+  return { giveUp: false, next: { count, firstMs, nextAttemptMs: nowMs + failureBackoffMs(count) } }
+}
+
+// agent name -> consecutive failed restart attempts for the CURRENT due slot.
+// Cleared on success and on giving up. In-memory like lastRestart.
+const restartFailures = new Map<string, RestartFailureState>()
+
 // Agents whose stand-down for the guard's daily tier has already been logged.
 // The condition is steady state, not an event: without this the runner would
 // write the same line every 60 seconds, 1440 times a day, per agent.
@@ -117,6 +167,7 @@ async function checkAgent(name: string, nowMs: number): Promise<void> {
   const cfg = readAutoRestartConfig(name)
   if (!cfg.enabled) {
     lastRestart.delete(name) // re-seed cleanly if re-enabled later
+    restartFailures.delete(name)
     return
   }
   // Sub-agents must be up to be restarted; the main session is launchd-managed
@@ -213,15 +264,39 @@ async function checkAgent(name: string, nowMs: number): Promise<void> {
       'auto-restart: open-question deferral exceeded cap, restarting anyway')
   }
 
+  // Hold off inside the backoff window opened by a previous failure. Checked
+  // HERE, after the due/idle/question gates, so a backoff can never mask a
+  // reason the restart was skipped for anyway.
+  const failure = restartFailures.get(name)
+  if (failure && nowMs < failure.nextAttemptMs) {
+    logger.debug({ name, failures: failure.count, waitMs: failure.nextAttemptMs - nowMs },
+      'auto-restart: in failure backoff, not retrying this tick')
+    return
+  }
+
   try {
     await performRestart(name, cfg)
     lastRestart.set(name, nowMs)
+    restartFailures.delete(name)
     // A restart does not answer the question -- reset the streak so the next
     // due slot gets a full deferral window again instead of overriding at once.
     openQuestionDeferrals.delete(name)
     logger.info({ name, mode: name === MAIN_AGENT_ID ? 'fresh(main)' : cfg.mode }, 'auto-restart: restarted session')
   } catch (err) {
-    logger.warn({ err, name }, 'auto-restart: restart failed')
+    const verdict = advanceFailureState(restartFailures.get(name) ?? null, nowMs)
+    if (verdict.giveUp) {
+      // Give up on THIS slot: advance lastRestart so the runner stops retrying,
+      // and say so at warn. The next due slot gets a full set of attempts again.
+      restartFailures.delete(name)
+      lastRestart.set(name, nowMs)
+      logger.warn({ err, name, attempts: verdict.attempts, sinceMs: nowMs - verdict.firstMs },
+        'auto-restart: restart failed, giving up on this slot (attempt cap reached)')
+      return
+    }
+    restartFailures.set(name, verdict.next)
+    logger.warn({ err, name, attempt: verdict.next.count, maxAttempts: MAX_RESTART_ATTEMPTS,
+      retryInMs: verdict.next.nextAttemptMs - nowMs },
+      'auto-restart: restart failed, backing off before retry')
   }
 }
 
