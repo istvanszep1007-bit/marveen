@@ -471,10 +471,34 @@ if [[ "${missing}" -gt 0 ]]; then
   # queue, where it survives the agent being asleep at 04:30 and gets read on
   # the next turn. Best-effort: a messaging problem must not change the exit
   # code or mask the real failure.
+  #
+  # TWO BUGS FIXED HERE 2026-09-25 (card ffedf99d), both of which made this
+  # alert a decoration rather than a channel:
+  #   1. It was addressed to `halpali halpali` -- an agent that does not exist on
+  #      this install (measured against /api/agents: gembaecho, leanarchivist,
+  #      leanchief, leandev, leanlibrarian, leanpublisher, leanscout, leanwriter).
+  #      A message to an unknown agent is not delivered to anyone. The recipient is
+  #      now MAIN_AGENT_ID, resolved above from .env the way src/env.ts does it,
+  #      which is also the one target the router serves WITHOUT a tmux session
+  #      (src/web/message-router.ts: `msg.to_agent === MAIN_AGENT_ID` takes the
+  #      pull path). That matters for a 04:30 job: every other agent may be asleep.
+  #   2. `>/dev/null 2>&1 || true` threw the result away. agent-msg.sh exists
+  #      precisely because a send can fail silently (HTTP 200 with no id, 401, a
+  #      dead dashboard), and it reports that with exit 1 and a FAIL line -- which
+  #      this call then discarded. A backup whose failure alert fails quietly is
+  #      back to the silence the verification above exists to break.
+  # Still best-effort: the delivery is reported, never allowed to change the exit
+  # code or mask the real failure. The `if` form is what keeps `set -e` out of it.
   if [[ -x "${REPO_ROOT}/scripts/agent-msg.sh" ]]; then
-    bash "${REPO_ROOT}/scripts/agent-msg.sh" halpali halpali \
-      "[MENTES] A napi mentes ellenorzese ELBUKOTT ${STAMP}-kor: ${missing} tetel hianyzik az archivumbol (reszletek: logs/backup.log). Az archivum NEM tekintheto jo masolatnak." \
-      >/dev/null 2>&1 || true
+    _alert_text="[MENTES] A napi mentes ellenorzese ELBUKOTT ${STAMP}-kor: ${missing} tetel hianyzik az archivumbol (reszletek: logs/backup.log). Az archivum NEM tekintheto jo masolatnak."
+    if _alert_out="$(bash "${REPO_ROOT}/scripts/agent-msg.sh" "${MAIN_AGENT_ID}" "${MAIN_AGENT_ID}" "${_alert_text}" 2>&1)"; then
+      echo "backup: failure alert delivered to ${MAIN_AGENT_ID} (${_alert_out})"
+    else
+      echo "backup: WARNING -- the failure alert to ${MAIN_AGENT_ID} was NOT delivered: ${_alert_out}" >&2
+      echo "backup:   nobody has been told about the ${missing} missing item(s); see store/agent-msg-failures.log" >&2
+    fi
+  else
+    echo "backup: WARNING -- scripts/agent-msg.sh is missing or not executable; no failure alert was sent." >&2
   fi
   exit 6
 fi
