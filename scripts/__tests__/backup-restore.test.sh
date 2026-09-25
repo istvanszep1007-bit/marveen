@@ -125,6 +125,23 @@ printf '# a report\nbody\n' > "$F/agents/someagent/reports/r.md"
 printf 'identity\n' > "$F/agents/someagent/CLAUDE.md"
 ln -s "../../../home/.claude/settings.json" "$F/agents/someagent/.claude-config/settings.json"
 
+# An agent with its OWN .claude-config/projects (a real directory, not the
+# legacy symlink), holding one real memory, one EMPTY memory dir, and a
+# transcript sibling that must stay out -- see section (7b).
+mkdir -p "$F/agents/ownagent/.claude-config/projects/-slug-a/memory" \
+         "$F/agents/ownagent/.claude-config/projects/-slug-empty/memory"
+printf -- '---\nname: own-memory\ndescription: the agent wrote this itself\n---\n\nthe fact.\n' \
+  > "$F/agents/ownagent/.claude-config/projects/-slug-a/memory/own-memory.md"
+printf '{"transcript":"25 MB of this in real life"}\n' \
+  > "$F/agents/ownagent/.claude-config/projects/-slug-a/session.jsonl"
+printf 'identity\n' > "$F/agents/ownagent/CLAUDE.md"
+# And an agent still on the LEGACY shape: projects is a symlink into the shared
+# ~/.claude/projects. find must not follow it, or the shared store lands in the
+# archive a second time, once per agent.
+mkdir -p "$F/agents/linkagent/.claude-config"
+ln -s "$BASE/home/.claude/projects" "$F/agents/linkagent/.claude-config/projects"
+printf 'identity\n' > "$F/agents/linkagent/CLAUDE.md"
+
 # a real git repo with a local-only branch, so the bundle path is exercised
 ( cd "$F" && git init -q . \
   && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m "root" \
@@ -321,6 +338,45 @@ else
   fail "the symlink is skipped AND its target is missing -- that IS a loss"
 fi
 
+
+echo
+echo "(7b) an agent's OWN memory -- the trap that costs nothing today"
+# Card 475fc6c8. The agents/ rule excludes .claude-config/projects/** by path,
+# which is right for the transcripts (56 MB under leandev alone) and wrong for
+# the memory/ directories inside it. Measured 2026-09-25 on the live tree: 8 such
+# directories exist, all under leandev, ALL EMPTY, and the other six agents still
+# symlink projects into the main agent's store. So the gap costs nothing TODAY --
+# and the day one of them is switched to its own directory, its memories would
+# start landing outside every archive with nothing saying so. This section is
+# what makes that day loud instead of silent.
+P_OWN="agents/ownagent/.claude-config/projects/-slug-a/memory/own-memory.md"
+if [ -f "$R/repo/$P_OWN" ] && cmp -s "$F/$P_OWN" "$R/repo/$P_OWN"; then
+  pass "restored, byte-identical: an agent's own memory file"
+else
+  fail "an agent's own .claude-config/projects/*/memory file did NOT come back"
+fi
+# The exclusion must still hold for everything else in that tree -- the whole
+# point is to take memory/ back WITHOUT taking the transcripts with it.
+if [ -e "$R/repo/agents/ownagent/.claude-config/projects/-slug-a/session.jsonl" ]; then
+  fail "the transcript sibling was carried too -- the exclusion no longer holds, re-measure the archive size"
+else
+  pass "the transcript next to it stayed out (memory/ is taken back, the tree is not)"
+fi
+# An empty memory/ is the common case right now, and a directory with no files
+# is exactly the thing tar can drop without anyone noticing.
+if [ -d "$R/repo/agents/ownagent/.claude-config/projects/-slug-empty/memory" ]; then
+  pass "an EMPTY memory/ still comes back as a directory"
+else
+  fail "an empty memory/ vanished in the round trip -- the restored agent has no place to write"
+fi
+# The legacy shape: projects is a symlink into the shared store. find must not
+# follow it; if it does, the shared memories are archived once per agent.
+if [ -e "$R/repo/agents/linkagent/.claude-config/projects" ]; then
+  fail "the symlinked projects WAS followed -- the shared store is now duplicated per agent"
+else
+  pass "a symlinked projects/ contributes nothing (its content is carried once, under home/)"
+fi
+
 echo
 echo "(8) the git bundle -- local-only commits actually come back"
 # 2026-09-04 assumed the source lives on a remote. It does not: this install has
@@ -428,6 +484,54 @@ if ! grep -q 'cp -pR "${base}/${rel}"' "$E/scripts/backup.sh"; then
   else fail "a backup that copied NOTHING exited 0"; sed 's/^/        /' "$EOUT"; fi
 else
   fail "mutation 2 did not apply -- test (11) measured nothing"
+fi
+
+
+echo
+echo "(11b) mutation: dropping the agents-memory rule must FAIL the backup"
+# The rule added for card 475fc6c8 is only worth having if its ABSENCE is loud.
+# backup.sh carries a load-bearing check for it, guarded on a memory directory
+# that actually holds a file -- so remove the rule, keep the check, and the
+# backup must refuse. Measured first by hand 2026-09-25: exit 6, and the archive
+# really did lose own-memory.md. The mutation runs on a COPY; the live
+# scripts/backup.sh is never patched, so a scheduled backup can never hit a
+# momentarily broken script.
+M="$BASE/install-mut3"
+mkdir -p "$M/scripts" "$M/backups"
+cp -a "$F/store" "$M/store"
+cp -a "$F/agents" "$M/agents"
+cp -p "$F/.env" "$M/.env"
+python3 - "$F/scripts/backup.sh" "$M/scripts/backup.sh" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+s = open(src).read()
+rule = """if [[ -d agents ]]; then
+  find agents -maxdepth 6 -path '*/.claude-config/projects/*' -type d -name memory \\
+    -print >> "${REPOLIST}"
+fi"""
+open(dst, 'w').write(s.replace(rule, "# MUTATED: the agents-memory rule is gone"))
+if rule not in s: print("MUTATION SOURCE NOT FOUND")
+PY
+if ! grep -q "maxdepth 6 -path '\*/\.claude-config/projects/\*' -type d -name memory" "$M/scripts/backup.sh"; then
+  MOUT="$BASE/mut3.out"
+  HOME="$H" BACKUP_DIR="$M/backups" bash "$M/scripts/backup.sh" > "$MOUT" 2>&1
+  MRC=$?
+  if [ "$MRC" -ne 0 ]; then
+    pass "removing the agents-memory rule fails the backup (exit=$MRC)"
+  else
+    fail "the backup went green WITHOUT carrying any agent's own memory"
+    sed 's/^/        /' "$MOUT"
+  fi
+  # And prove the mutation actually removed content, not just tripped a check:
+  # a guard that fires on an archive which is fine anyway proves nothing.
+  MARC="$(ls -1t "$M/backups"/claudeclaw-*.tar.gz 2>/dev/null | head -1)"
+  if [ -n "$MARC" ] && tar -tzf "$MARC" | grep -q 'agents/ownagent/.claude-config/projects/-slug-a/memory/own-memory.md'; then
+    fail "the mutated archive still holds the memory file -- (11b) measured nothing"
+  else
+    pass "and the mutated archive really is missing the memory file"
+  fi
+else
+  fail "mutation 3 did not apply -- test (11b) measured nothing"
 fi
 
 echo

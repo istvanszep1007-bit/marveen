@@ -144,6 +144,36 @@ if [[ -d agents ]]; then
     -print >> "${REPOLIST}"
 fi
 
+# The agents' OWN file-based memory -- the mirror of the ~/.claude/projects rule
+# below, one level down, and the only part of .claude-config/projects that must
+# come back. The exclusion above drops the whole tree by path, which is right for
+# the transcripts (56 MB under leandev alone today) and WRONG for the memory/
+# directories inside it: those are hand-written markdown with frontmatter and
+# [[links]], exactly the class of file the 2026-09-04 restore test proved the
+# SQLite copy cannot stand in for.
+#
+# Measured 2026-09-25 (card 475fc6c8), and the numbers are the reason this is a
+# TRAP and not yet a loss:
+#   - 8 memory/ directories exist, ALL of them under agents/leandev, and ALL of
+#     them EMPTY (0 files). So today the gap costs nothing.
+#   - the other 6 agents (gembaecho, leanarchivist, leanlibrarian, leanpublisher,
+#     leanscout, leanwriter) have .claude-config/projects as a SYMLINK to
+#     ~/.claude/projects, i.e. they still write into the MAIN agent's store,
+#     which the home/ rule below already carries. leanchief has no projects at all.
+#   - the moment any of those six is switched to its own directory (which is the
+#     documented intent -- see the comment block in src/web/agent-process.ts
+#     around ISOLATED_CONFIG_SKIP), its memories start landing here, and with the
+#     rule above they would land OUTSIDE every archive. Silently. That is the
+#     same shape as 2026-09-04, and the point of adding this now is that nothing
+#     about the day of the switch would make anyone look at backup.sh.
+#
+# find does not follow symlinks, so the six symlinked agents contribute nothing
+# here and the shared store is not carried twice.
+if [[ -d agents ]]; then
+  find agents -maxdepth 6 -path '*/.claude-config/projects/*' -type d -name memory \
+    -print >> "${REPOLIST}"
+fi
+
 # home/ group (relative to $HOME)
 # ~/.claude -- the SAME inversion as agents/ above, for the same reason, one
 # level up. Until 2026-09-21 this was a whitelist of four names (skills,
@@ -415,6 +445,19 @@ fi
 if ( cd "${HOME}" && find .claude/projects -maxdepth 2 -type d -name memory -print -quit 2>/dev/null | grep -q . ); then
   grep -qE "^home/\.claude/projects/.*/memory(/|$)" "${ARCHIVE_LIST}" || {
     echo "backup: MISSING load-bearing item: the file-based memory directories" >&2
+    missing=$((missing + 1))
+  }
+fi
+
+# The same, for an agent's OWN memory (card 475fc6c8). Guarded on a memory
+# directory that actually HOLDS something: every one of the 8 that exist today is
+# empty, and an empty directory is carried but says nothing about whether the
+# rule works. Requiring a file means this check stays quiet until the first agent
+# really writes its own memory -- and speaks up from that moment on.
+if find agents -maxdepth 7 -path '*/.claude-config/projects/*/memory/*' -type f \
+     -print -quit 2>/dev/null | grep -q .; then
+  grep -qE "^repo/agents/.*/\.claude-config/projects/.*/memory(/|$)" "${ARCHIVE_LIST}" || {
+    echo "backup: MISSING load-bearing item: an agent's own file-based memory" >&2
     missing=$((missing + 1))
   }
 fi
