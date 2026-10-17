@@ -58,6 +58,36 @@ _guard_sender() {
   printf '%s' "${MAIN_AGENT_ID:-marveen}"
 }
 
+# WHAT THE GUARD MAY SAY ABOUT AUTH (card e65e15e7, shell twin of #1846).
+#
+# Both alerts below used to say, unconditionally, that the main agent depends
+# on the shared, rotating credential and can 401. Measured 2026-09-25 on a
+# boot that drew that alert: the tmux global env and the main claude's
+# /proc/<pid>/environ both carried CLAUDE_CODE_OAUTH_TOKEN, and
+# ~/.claude/.credentials.json did not exist at all. The env token outranks the
+# /login session (documented precedence; measured 2026-10-09 in #1805), so the
+# auth half of the alert was false. The respawn path (src/web/main-config-
+# decision.ts) was fixed in #1846; this is the boot path. The verdict is read
+# from THIS launch's environment, the same fact #1846 keys on: the block near
+# the top exports CLAUDE_CODE_OAUTH_TOKEN (from .env, else the fleet token file)
+# before either trigger runs. $1 = "log" (English, failures log) or "msg"
+# (Hungarian, the inter-agent alert).
+_guard_auth_verdict() {
+  if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+    if [ "${1:-msg}" = "log" ]; then
+      printf '%s' "401 risk: NO -- this launch exports CLAUDE_CODE_OAUTH_TOKEN, which outranks the /login session."
+    else
+      printf '%s' "401-VESZELY: NINCS -- ez az inditas exportalja a CLAUDE_CODE_OAUTH_TOKEN-t, ami a dokumentalt sorrendben megelozi a /login sessiont. Ami valos: az izolacio hianya (kozos plugin-slot es poller)."
+    fi
+  else
+    if [ "${1:-msg}" = "log" ]; then
+      printf '%s' "401 risk: YES -- this launch exports no CLAUDE_CODE_OAUTH_TOKEN, so auth rides the /login session, which can expire."
+    else
+      printf '%s' "401-VESZELY: VAN -- ez az inditas NEM exportal CLAUDE_CODE_OAUTH_TOKEN-t, igy az auth a /login session-bol megy, ami lejarhat: ekkor 401-be all a TUI, es a csatorna NEMAN elerhetetlen lesz."
+    fi
+  fi
+}
+
 # Read MAIN_AGENT_ID and CHANNEL_PROVIDER from .env WITHOUT exporting
 # every variable into the shell environment. `set -a && source .env`
 # would also export TELEGRAM_BOT_TOKEN, which then leaks into the tmux
@@ -1097,14 +1127,24 @@ if [ -n "$_node_bin" ] && [ -f "$INSTALL_DIR/dist/web/agent-process.js" ]; then
   # carrying one and still landing on the shared root means the setting is
   # missing, not that isolation was declined. This is the shape issue #835 is
   # about, and trigger 2 is structurally blind to it.
-  if [ -z "$CFG_ENV" ] && [ ! -d "$INSTALL_DIR/.channels-config" ] && [ -s "$INSTALL_DIR/store/.claude-oauth-token" ]; then
-    echo "$(date '+%Y-%m-%d %H:%M:%S') channels.sh: WARN main-agent starting on SHARED ~/.claude although a fleet setup-token exists (store/.claude-oauth-token) -- MAIN_AGENT_ISOLATED_CONFIG is unset, so the main bot authenticates from the rotating shared credential and can 401 into a silent channel." >> "$INSTALL_DIR/store/channels-failures.log"
+  #
+  # NARROWED like its respawn twin (#1805 / #1846, card e65e15e7): it fires only
+  # when this launch does NOT export the token. With the token exported the
+  # shared root authenticates from it and there is nothing to expire -- the old
+  # alert said the opposite on every such boot. The top block exports the token
+  # only when .env exists, so a token file with no .env still fires this, and
+  # then truthfully. The healthy case gets a trace line, as on the respawn path.
+  if [ -z "$CFG_ENV" ] && [ ! -d "$INSTALL_DIR/.channels-config" ] && [ -s "$INSTALL_DIR/store/.claude-oauth-token" ] && [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') channels.sh: main-agent shared ~/.claude, fleet token exported as CLAUDE_CODE_OAUTH_TOKEN (outranks the /login session per the documented precedence) -- nothing to warn about" >> "$INSTALL_DIR/store/channels-failures.log"
+  fi
+  if [ -z "$CFG_ENV" ] && [ ! -d "$INSTALL_DIR/.channels-config" ] && [ -s "$INSTALL_DIR/store/.claude-oauth-token" ] && [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') channels.sh: WARN main-agent starting on SHARED ~/.claude although a fleet setup-token exists (store/.claude-oauth-token) and this launch does NOT export it as CLAUDE_CODE_OAUTH_TOKEN -- $(_guard_auth_verdict log)" >> "$INSTALL_DIR/store/channels-failures.log"
     if [ -f "$INSTALL_DIR/store/.dashboard-token" ]; then
       _guard_port="$(grep -E '^WEB_PORT=' "$INSTALL_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2-)"
       curl -s --max-time 5 -X POST "http://localhost:${_guard_port:-3420}/api/messages" \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $(cat "$INSTALL_DIR/store/.dashboard-token")" \
-        -d "{\"from\":\"$(_guard_sender)\",\"to\":\"${MAIN_AGENT_ID:-marveen}\",\"content\":\"[GUARD] A fo agens a KOZOS ~/.claude alol indult, pedig van flotta setup-token (store/.claude-oauth-token). A MAIN_AGENT_ISOLATED_CONFIG nincs beallitva, ezert az auth a rotalodo megosztott credentialbol megy: ez lejarhat, 401-be all a TUI, es a csatorna NEMAN elerhetetlen lesz. Teendo: MAIN_AGENT_ISOLATED_CONFIG=1 beallitasa, majd channels session restart.\"}" \
+        -d "{\"from\":\"$(_guard_sender)\",\"to\":\"${MAIN_AGENT_ID:-marveen}\",\"content\":\"[GUARD] A fo agens a KOZOS ~/.claude alol indult, van flotta setup-token (store/.claude-oauth-token), de ez az inditas NEM exportalja CLAUDE_CODE_OAUTH_TOKEN-kent. $(_guard_auth_verdict msg) Teendo: MAIN_AGENT_ISOLATED_CONFIG=1 beallitasa, majd channels session restart; vagy annak kideritese, miert maradt ki a token exportja.\"}" \
         -o /dev/null -w '%{http_code}' 2>>"$INSTALL_DIR/store/channels-failures.log" > "$INSTALL_DIR/store/.channels-guard-http.$$" || true
       # Honest delivery (NOTIFYVAKSWEEP826 zaro kor): a fenti WARN csak a helyi
       # logban el -- ha a koordinatornak szolo POST elbukik, az is a logba
@@ -1124,13 +1164,13 @@ if [ -n "$_node_bin" ] && [ -f "$INSTALL_DIR/dist/web/agent-process.js" ]; then
   # deleted with no .env key backing it. Needing that dir is what makes this
   # trigger blind on a fresh install, hence trigger 1.
   if [ -z "$CFG_ENV" ] && [ -d "$INSTALL_DIR/.channels-config" ]; then
-    echo "$(date '+%Y-%m-%d %H:%M:%S') channels.sh: WARN main-agent starting on SHARED ~/.claude although isolated dir $INSTALL_DIR/.channels-config exists -- MAIN_AGENT_ISOLATED_CONFIG resolution came back empty (overrides/.env key lost?). Auth rides the rotating shared session and can 401." >> "$INSTALL_DIR/store/channels-failures.log"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') channels.sh: WARN main-agent starting on SHARED ~/.claude although isolated dir $INSTALL_DIR/.channels-config exists -- MAIN_AGENT_ISOLATED_CONFIG resolution came back empty (cause not measured here; check store/config-overrides.json, then .env). $(_guard_auth_verdict log)" >> "$INSTALL_DIR/store/channels-failures.log"
     if [ -f "$INSTALL_DIR/store/.dashboard-token" ]; then
       _guard_port="$(grep -E '^WEB_PORT=' "$INSTALL_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2-)"
       curl -s --max-time 5 -X POST "http://localhost:${_guard_port:-3420}/api/messages" \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $(cat "$INSTALL_DIR/store/.dashboard-token")" \
-        -d "{\"from\":\"$(_guard_sender)\",\"to\":\"${MAIN_AGENT_ID:-marveen}\",\"content\":\"[GUARD] A channels session most a KOZOS ~/.claude alol indult, pedig letezik izolalt config dir (.channels-config). A MAIN_AGENT_ISOLATED_CONFIG beallitas valoszinuleg elveszett (store/config-overrides.json torlodott es nincs .env kulcs). Az auth a rotalodo shared sessionbol megy, 401-veszely. Teendo: MAIN_AGENT_ISOLATED_CONFIG=1 visszaallitasa, majd channels session restart.\"}" \
+        -d "{\"from\":\"$(_guard_sender)\",\"to\":\"${MAIN_AGENT_ID:-marveen}\",\"content\":\"[GUARD] A channels session most a KOZOS ~/.claude alol indult, pedig letezik izolalt config dir (.channels-config): a MAIN_AGENT_ISOLATED_CONFIG erre az inditasra uresen oldott fel. Az okat ez a script nem meri: nezd meg a store/config-overrides.json-t, utana a .env-et. $(_guard_auth_verdict msg) Teendo: ha az izolalt futas a cel es a kulcs sehol nincs beallitva, MAIN_AGENT_ISOLATED_CONFIG=1, majd channels session restart; ha explicit 0, az szandekos beallitas.\"}" \
         -o /dev/null -w '%{http_code}' 2>>"$INSTALL_DIR/store/channels-failures.log" > "$INSTALL_DIR/store/.channels-guard-http.$$" || true
       # Honest delivery (NOTIFYVAKSWEEP826 zaro kor): a fenti WARN csak a helyi
       # logban el -- ha a koordinatornak szolo POST elbukik, az is a logba
